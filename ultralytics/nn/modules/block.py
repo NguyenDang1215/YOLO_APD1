@@ -482,6 +482,80 @@ class C2fAttn(nn.Module):
         return self.cv2(torch.cat(y, 1))
 
 
+class SimAM(nn.Module):
+    def __init__(self, channels, reduction_ratio=16, num_heads=4, e_lambda=1e-4):
+        super(EnhancedSimAM, self).__init__()
+        self.e_lambda = e_lambda
+        self.channels = channels
+        self.num_heads = num_heads
+        self.reduction_ratio = reduction_ratio
+
+        # Dynamic reduction ratio
+        self.reduction_ratio = nn.Parameter(torch.tensor(float(reduction_ratio)))
+        self.min_reduction_ratio = 4  # Minimum reduction ratio to avoid excessive compression
+
+        # Spatial attention components
+        self.spatial_activation = nn.Sigmoid()
+
+        # Multi-head channel attention components
+        self.head_dim = channels // num_heads
+        assert self.head_dim * num_heads == channels, "channels must be divisible by num_heads"
+        
+        self.channel_fc1 = nn.Linear(channels, channels // reduction_ratio)
+        self.channel_fc2 = nn.Linear(channels // reduction_ratio, channels)
+        self.channel_activation = nn.Sigmoid()
+
+        # Cross-attention components
+        self.cross_attention = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads)
+
+        # Batch normalization
+        self.bn = nn.BatchNorm2d(channels)
+
+        # Learnable parameters for spatial attention
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.beta = nn.Parameter(torch.ones(1))
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        n = w * h - 1
+
+        # Normalize input
+        x_norm = self.bn(x)
+
+        # Spatial attention
+        x_minus_mu_square = (x_norm - x_norm.mean(dim=[2, 3], keepdim=True)).pow(2)
+        spatial_attention = (
+            x_minus_mu_square
+            / (
+                4
+                * (x_minus_mu_square.sum(dim=[2, 3], keepdim=True) / n + self.e_lambda)
+            )
+            + 0.5
+        )
+        spatial_attention = self.spatial_activation(spatial_attention)
+
+        # Channel attention with dynamic reduction ratio
+        reduction_ratio = max(self.min_reduction_ratio, int(self.reduction_ratio.item()))
+        channel_squeeze = F.avg_pool2d(x_norm, kernel_size=(h, w)).view(b, c)
+        channel_excitation = self.channel_fc1(channel_squeeze)
+        channel_excitation = F.relu(channel_excitation)
+        channel_excitation = self.channel_fc2(channel_excitation)
+        channel_excitation = self.channel_activation(channel_excitation).view(b, c, 1, 1)
+
+        # Multi-head channel attention
+        channel_excitation = channel_excitation.view(b, self.num_heads, self.head_dim, 1, 1)
+        channel_excitation = channel_excitation.repeat(1, 1, 1, h, w).view(b, c, h, w)
+
+        # Cross-attention
+        x_flat = x_norm.view(b, c, h * w).permute(2, 0, 1)  # (h*w, b, c)
+        cross_attention_output, _ = self.cross_attention(x_flat, x_flat, x_flat)
+        cross_attention_output = cross_attention_output.permute(1, 2, 0).view(b, c, h, w)
+
+        # Combine spatial, channel, and cross-attention
+        combined_attention = spatial_attention * channel_excitation * cross_attention_output
+
+        # Apply attention with residual connection
+        return x + self.gamma * (x * combined_attention) + self.beta
 class ImagePoolingAttn(nn.Module):
     """ImagePoolingAttn: Enhance the text embeddings with image-aware information."""
 
