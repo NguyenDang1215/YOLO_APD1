@@ -54,6 +54,8 @@ from .block import (
     RepVGGDW,
     ResNetLayer,
     SCDown,
+    SimAM,
+    C2f_DSC_LR
 )
 from .conv import (
     SimFusion_4in,
@@ -77,6 +79,8 @@ from .conv import (
     LightConv,
     RepConv,
     SpatialAttention,
+    DSC,
+    Conv_LR
 )
 from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
 from .transformer import (

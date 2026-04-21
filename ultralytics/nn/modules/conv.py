@@ -8,6 +8,9 @@ import torch
 import torch.nn as nn
 
 __all__ = (
+    "DSC_LR_SC",
+    "DSC",
+    "Conv_LR",
     "Conv",
     "SimConv",
     "Conv2",
@@ -24,6 +27,64 @@ __all__ = (
     "RepConv",
 )
 
+class DSC_LR_SC(nn.Module):
+    """
+    Khối nén "Trùm cuối" theo bài báo ResNet for Edge: 
+    Depthwise 3x3 + Low-Rank Pointwise (1x1) + Internal Shortcut.
+    """
+    def __init__(self, c1, c2, s=1, r=16, act=True):
+        """
+        c1: Số kênh đầu vào
+        c2: Số kênh đầu ra
+        s: stride
+        r: rank (Hệ số cổ chai cho Low-Rank, theo bài báo là 16, 32, 64)
+        """
+        super().__init__()
+        
+        # Điều kiện kích hoạt Shortcut: Stride = 1 VÀ Kênh vào = Kênh ra
+        self.use_shortcut = (s == 1 and c1 == c2)
+        
+        # BƯỚC 1: Depthwise Conv (k=3, groups=c1)
+        # Sử dụng Conv của YOLO, truyền g=c1 để biến nó thành Depthwise
+        self.dw = Conv(c1, c1, k=3, s=s, g=c1, act=act)
+        
+        # BƯỚC 2: Low-Rank Pointwise 
+        # Tách chập 1x1 thành 2 chập nhỏ qua "cửa ải" r
+        r = max(1, r) # Đề phòng lỗi r = 0
+        self.pw_reduce = Conv(c1, r, k=1, s=1, act=act)  # Bóp xuống r
+        self.pw_expand = Conv(r, c2, k=1, s=1, act=act)  # Kích lên c2
+
+    def forward(self, x):
+        dw_out = self.dw(x)
+        lr_out = self.pw_expand(self.pw_reduce(dw_out))
+        
+        # BƯỚC 3: Internal Shortcut
+        if self.use_shortcut:
+            return dw_out + lr_out
+        return lr_out
+    
+class Conv_LR(nn.Module):
+    def __init__(self, c1, c2, rank_ratio=4, k=1, s=1, act=True): 
+        super().__init__()
+        r = max(1, c1 // rank_ratio)
+        self.reduce = Conv(c1, r, k=1, s=1, act=act)
+        self.expand = Conv(r, c2, k=1, s=s, act=act)
+
+    def forward(self, x):
+        return self.expand(self.reduce(x))
+
+class DSC(nn.Module):
+    """Depthwise Separable Convolution hoàn chỉnh dùng class có sẵn của YOLO"""
+    def __init__(self, c1, c2, k=3, s=1, act=True):
+        super().__init__()
+        # Bước 1: Gọi class DWConv có sẵn (Tích chập chiều sâu, không đổi số kênh)
+        self.dw = DWConv(c1, c1, k=k, s=s, act=act) 
+        
+        # Bước 2: Gọi Conv 1x1 (Tích chập điểm để trộn kênh)
+        self.pw = Conv(c1, c2, k=1, s=1, act=act)
+
+    def forward(self, x):
+        return self.pw(self.dw(x))
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
     """Pad to 'same' shape outputs."""

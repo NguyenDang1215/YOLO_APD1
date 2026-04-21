@@ -1,22 +1,26 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 """Block modules."""
 
+from matplotlib.pylab import c_
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
-from .conv import Conv, SimConv,DWConv, GhostConv, LightConv, RepConv, autopad
+from .conv import Conv, SimConv,DWConv, GhostConv, LightConv, RepConv, autopad, Conv_LR, DSC_LR_SC,DSC
 from .transformer import TransformerBlock
 
 __all__ = (
+    "Bottleneck_DSC_LR",
+    "C2f_DSC_LR",
     "DFL",
     "HGBlock",
     "HGStem",
     "SPP",
     "SPPF",
     "SimSPPF",
+    "SimAM",
     "C1",
     "C2",
     "C3",
@@ -50,6 +54,47 @@ __all__ = (
 )
 
 
+class Bottleneck_DSC_LR(nn.Module):
+    """Bottleneck tùy chỉnh của YOLO: Thay lớp 3x3 bằng khối nén bài báo"""
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5, r=16):
+        super().__init__()
+        c_ = int(c2 * e)  # Kênh ẩn
+        
+        # Lớp 1: Conv 1x1 hạ chiều (Giữ nguyên của YOLO)
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        
+        # Lớp 2: THAY THẾ khối 3x3 nặng nề bằng DSC_LR_SC
+        self.cv2 = DSC_LR_SC(c_, c2, s=1, r=r)
+        
+        # Shortcut bên ngoài của Bottleneck
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class C2f_DSC_LR(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=False, r=16, g=1, e=0.5): 
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        # Truyền r=r một cách tường minh vào Bottleneck
+        self.m = nn.ModuleList(
+            Bottleneck_DSC_LR(self.c, self.c, shortcut, g, k=(3, 3), e=1.0, r=r) 
+            for _ in range(n)
+        )
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+    
+    def forward_split(self, x):
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
+    
 class DFL(nn.Module):
     """
     Integral module of Distribution Focal Loss (DFL).
@@ -155,12 +200,15 @@ class SimSPPF(nn.Module):
         self.cv1 = SimConv(c1, c_, 1, 1)
         self.cv2 = SimConv(c_ * 4, c2, 1, 1)
         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
-    
+        self.attention = SimAM(c_ * 4, c_ * 4) # Truyền đúng số kênh sau khi Concat
+
     def forward(self, x):
         x = self.cv1(x)
         y1 = self.m(x)
         y2 = self.m(y1)
-        return self.cv2(torch.cat([x, y1, y2, self.m(y2)], 1))
+        y3 = self.m(y2)
+        out = torch.cat((x, y1, y2, y3), 1)
+        return self.cv2(self.attention(out))
 
 class SPP(nn.Module):
     """Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729."""
@@ -487,76 +535,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class SimAM(nn.Module):
-    def __init__(self, channels, reduction_ratio=16, num_heads=4, e_lambda=1e-4):
-        super(EnhancedSimAM, self).__init__()
+    # SimAM: Parameter-Free Attention Module (Ép xung FPS)
+    def __init__(self, c1, c2, e_lambda=1e-4):
+        super().__init__()
         self.e_lambda = e_lambda
-        self.channels = channels
-        self.num_heads = num_heads
-
-        # Ensure num_heads is valid
-        if channels % num_heads != 0:
-            raise ValueError(f"channels ({channels}) must be divisible by num_heads ({num_heads}).")
-
-        self.head_dim = channels // num_heads
-
-        # Dynamic reduction ratio as a learnable parameter
-        self.reduction_ratio = nn.Parameter(torch.tensor(float(reduction_ratio), requires_grad=True))
-        self.min_reduction_ratio = 4  # Minimum value to avoid excessive compression
-
-        # Spatial attention components
-        self.spatial_activation = nn.Sigmoid()
-
-        # Channel attention components
-        self.channel_fc1 = nn.Linear(channels, channels // reduction_ratio)
-        self.channel_fc2 = nn.Linear(channels // reduction_ratio, channels)
-        self.channel_activation = nn.Sigmoid()
-
-        # Cross-attention components
-        self.cross_attention = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads)
-
-        # Batch normalization
-        self.bn = nn.BatchNorm2d(channels)
-
-        # Learnable parameters for spatial attention
-        self.gamma = nn.Parameter(torch.zeros(1))
-        self.beta = nn.Parameter(torch.ones(1, 1, 1, 1))  # Ensure broadcasting
 
     def forward(self, x):
         b, c, h, w = x.size()
-        n = max(1, w * h - 1)  # Ensure no division by zero
-
-        # Normalize input
-        x_norm = self.bn(x)
-
-        # Spatial attention
-        x_minus_mu_square = (x_norm - x_norm.mean(dim=[2, 3], keepdim=True)).pow(2)
-        denom = 4 * (x_minus_mu_square.sum(dim=[2, 3], keepdim=True) / (n + 1e-6) + self.e_lambda)
-        spatial_attention = (x_minus_mu_square / denom) + 0.5
-        spatial_attention = self.spatial_activation(spatial_attention)
-
-        # Channel attention with dynamic reduction ratio
-        reduction_ratio = max(self.min_reduction_ratio, int(self.reduction_ratio.detach().item()))
-        channel_squeeze = F.avg_pool2d(x_norm, kernel_size=(h, w)).view(b, c)
-        channel_excitation = self.channel_fc1(channel_squeeze)
-        channel_excitation = F.relu(channel_excitation)
-        channel_excitation = self.channel_fc2(channel_excitation)
-        channel_excitation = self.channel_activation(channel_excitation).view(b, c, 1, 1)
-
-        # Multi-head channel attention
-        channel_excitation = channel_excitation.view(b, self.num_heads, self.head_dim, 1, 1)
-        channel_excitation = channel_excitation.repeat(1, 1, 1, h, w).view(b, c, h, w)
-
-        # Cross-attention
-        x_flat = x_norm.view(b, c, h * w).permute(2, 0, 1)  # (h*w, b, c)
-        cross_attention_output, _ = self.cross_attention(x_flat, x_flat, x_flat)
-        cross_attention_output = cross_attention_output.permute(1, 2, 0).view(b, c, h, w)
-
-        # Combine spatial, channel, and cross-attention
-        combined_attention = spatial_attention * channel_excitation * cross_attention_output
-
-        # Apply attention with residual connection
-        return x + self.gamma * (x * combined_attention) + self.beta
-
+        n = w * h - 1
+        x_minus_mu_square = (x - x.mean(dim=[2, 3], keepdim=True)).pow(2)
+        y = x_minus_mu_square / (4 * (x_minus_mu_square.sum(dim=[2, 3], keepdim=True) / n + self.e_lambda)) + 0.5
+        return x * torch.sigmoid(y)
+    
+    
 class ImagePoolingAttn(nn.Module):
     """ImagePoolingAttn: Enhance the text embeddings with image-aware information."""
 
