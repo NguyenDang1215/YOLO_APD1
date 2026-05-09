@@ -1,7 +1,7 @@
 import traceback
 from ultralytics import YOLO
 
-yaml_path = "ultralytics/cfg/models/v8/yolov8m_goldacsim_edge.yaml"
+yaml_path = "ultralytics/cfg/models/v8/yolo8_goldacsim.yaml"
 
 print("🚀 Đang nổ máy động cơ YOLO-APD...")
 try:

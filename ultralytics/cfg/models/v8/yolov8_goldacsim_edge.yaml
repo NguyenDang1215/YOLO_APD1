@@ -1,5 +1,6 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
-# Phiên bản EDGE (DSC + Low-Rank + Shortcut) cho mô hình GoldAcSim
+# Phiên bản EDGE_OPTIMIZED (DSC + Low-Rank + C3Ghost + SimAM)
+# Tối ưu hóa đặc biệt cho thiết bị nhúng/Edge Device
 
 nc: 80 # Số class của bạn
 scales: 
@@ -10,53 +11,54 @@ backbone:
   - [-1, 1, Conv, [32, 3, 2]]       # 0: Stem bóp từ 64 -> 32
   
   # === STAGE 1 ===
-  - [-1, 1, DSC, [64, 3, 2]]       # 1: Downsample
-  - [-1, 3, C2f_DSC_LR, [64, True, 17]]  # 2: Trích xuất đặc trưng với Rank r=17
+  - [-1, 1, DSC, [64, 3, 2]]        # 1: Downsample
+  - [-1, 3, C2f_DSC_LR, [64, True, 17]]  # 2: Trích xuất đặc trưng với Rank r=17 (Nhánh P2)
   
   # === STAGE 2 ===
-  - [-1, 1, DSC, [128, 3, 2]]      # 3: Downsample
-  - [-1, 6, C2f_DSC_LR, [128, True, 32]] # 4: Rank r=32
+  - [-1, 1, DSC, [128, 3, 2]]       # 3: Downsample
+  - [-1, 6, C2f_DSC_LR, [128, True, 32]] # 4: Rank r=32 (Nhánh P3)
   
   # === STAGE 3 ===
-  - [-1, 1, DSC, [256, 3, 2]]      # 5: Downsample
-  - [-1, 6, C2f_DSC_LR, [256, True, 64]] # 6: Rank r=64
+  - [-1, 1, DSC, [256, 3, 2]]       # 5: Downsample
+  - [-1, 6, C2f_DSC_LR, [256, True, 64]] # 6: Rank r=64 (Nhánh P4)
   
   # === STAGE 4 ===
-  - [-1, 1, DSC, [512, 3, 2]]      # 7: Downsample
-  - [-1, 3, C2f_DSC_LR, [512, True, 128]] # 8: Rank r=128
+  - [-1, 1, DSC, [512, 3, 2]]       # 7: Downsample
+  - [-1, 3, C2f_DSC_LR, [512, True, 128]] # 8: Rank r=128 (Nhánh P5)
   
-  - [-1, 1, SimSPPF, [512, 5]]      # 9
-  - [-1, 1, SimAM, [512]]       # 10: Nén cổ chai 1x1 trước khi vào head
+  - [-1, 1, SimSPPF, [512, 5]]      # 9: Lọc đặc trưng không gian đa tỷ lệ
 
 head:
-  - [[2, 4, 6, 10], 1, SimFusion_4in, []] # 11
-  - [-1, 1, IFM, [[64, 32]]]             # 12
+  # === GIAI ĐOẠN 1: GOM TỤ VÀ PHÂN TÍCH TOÀN CỤC (IFM) ===
+  - [[2, 4, 6, 9], 1, SimFusion_4in, []] # 10: Trạm gom tổng 4 nhánh
+  - [-1, 1, IFM, [[64, 32]]]             # 11: Tổng Giám Đốc IFM vạch bối cảnh
 
-  # Nén cổ chai 1x1 bằng Low-Rank (rank_ratio = 4)
-  - [10, 1, Conv_LR, [512, 4]]            # 13
-  - [[4, 6, -1], 1, SimFusion_3in, [512]] # 14
-  - [[-1, 12], 1, InjectionMultiSum_Auto_pool, [512, [64, 32], 0]] # 15
-  
-  # Giữ nguyên C3Ghost vì nó đã là kỹ thuật nén tốt rồi
-  - [-1, 3, C3Ghost, [512, False]]       # 16
+  # === XỬ LÝ VÀ CHỐT NHÁNH P4 ===
+  - [9, 1, Conv_LR, [512, 4]]            # 12: Nén P5 bằng Low-Rank
+  - [[4, 6, -1], 1, SimFusion_3in, [512]] # 13: Ghép P3, P4, P5_nén
+  - [[-1, 11], 1, InjectionMultiSum_Auto_pool, [512, [64, 32], 0]] # 14: Tiêm bối cảnh vào P4
+  - [-1, 3, C3Ghost, [512, False]]       # 15: Trạm trung chuyển P4 bằng GhostConv
 
-  # Nén cổ chai 1x1 tiếp theo
-  - [6, 1, Conv_LR, [256, 4]]            # 17
-  - [[2, 4, -1], 1, SimFusion_3in, [256]] # 18
-  - [[-1, 12], 1, InjectionMultiSum_Auto_pool, [256, [64, 32], 1]] # 19
-  - [-1, 3, C3Ghost, [256, False]]       # 20
+  # === XỬ LÝ VÀ CHỐT NHÁNH P3 ===
+  - [6, 1, Conv_LR, [256, 4]]            # 16: Nén P4 bằng Low-Rank
+  - [[2, 4, -1], 1, SimFusion_3in, [256]] # 17: Ghép P2, P3, P4_nén
+  - [[-1, 11], 1, InjectionMultiSum_Auto_pool, [256, [64, 32], 1]] # 18: Tiêm bối cảnh vào P3
+  - [-1, 3, C3Ghost, [256, False]]       # 19: 🎉 CHỐT ĐẦU RA NHÁNH P3 ĐỂ DETECT
 
-  - [[20, 16, 10], 1, PyramidPoolAgg, [352, 2]] # 21
-  - [-1, 1, TopBasicLayer, [352, [64, 128]]]   # 22
+  # === GIAI ĐOẠN 2: THAY THẾ TRANSFORMER BẰNG SIMAM ===
+  - [[19, 15, 9], 1, PyramidPoolAgg, [352, 2]] # 20: Tàn sát không gian (băm đôi bằng stride=2)
+  - [-1, 1, Conv, [256, 1, 1]]                 # 21: Nén kênh thay cho TopBasicLayer (256 = 64 + 192)
+  - [-1, 1, SimAM, [256]]                         # 22: Chèn cơ chế Attention 0-parameter cực nhẹ
 
-  - [[20, 17], 1, AdvPoolFusion, []]           # 23
-  - [[-1, 22], 1, InjectionMultiSum_Auto_pool, [256, [64, 128], 0]] # 24
-  - [-1, 3, C3Ghost, [256, False]]             # 25
+  # === HOÀN THIỆN VÀ CHỐT NHÁNH P4 MỨC ĐỘ SÂU ===
+  - [[19, 16], 1, AdvPoolFusion, []]           # 23: Trộn P3_chốt và P4_nén
+  - [[-1, 22], 1, InjectionMultiSum_Auto_pool, [256, [64, 128], 0]] # 24: Tiêm bối cảnh toàn cục 2 vào P4
+  - [-1, 3, C3Ghost, [256, False]]             # 25: 🎉 CHỐT ĐẦU RA NHÁNH P4 ĐỂ DETECT
 
-  - [[-1, 13], 1, AdvPoolFusion, []]           # 26
-  - [[-1, 22], 1, InjectionMultiSum_Auto_pool, [512, [64, 128], 1]] # 27
-  
-  # Chốt chặn cuối cùng bằng C2f siêu nén (Rank r=128)
-  - [-1, 3, C2f_DSC_LR, [512, False, 128]]     # 28
+  # === HOÀN THIỆN VÀ CHỐT NHÁNH P5 MỨC ĐỘ SÂU ===
+  - [[-1, 12], 1, AdvPoolFusion, []]           # 26: Trộn P4_chốt và P5_nén
+  - [[-1, 22], 1, InjectionMultiSum_Auto_pool, [512, [64, 128], 1]] # 27: Tiêm bối cảnh toàn cục 2 vào P5
+  - [-1, 3, C3Ghost, [512, False]]             # 28: 🎉 CHỐT ĐẦU RA NHÁNH P5 ĐỂ DETECT (Thay C2f nặng nề)
 
-  - [[20, 25, 28], 1, Detect, [nc]] # Detect(P3, P4, P5)
+  # === XUẤT KẾT QUẢ DỰ ĐOÁN ===
+  - [[19, 25, 28], 1, Detect, [nc]] # 29: Detect(P3, P4, P5)
